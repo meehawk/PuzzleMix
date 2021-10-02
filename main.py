@@ -21,6 +21,18 @@ from logger import plotting, copy_script_to_folder, AverageMeter, RecorderMeter,
 import models
 from multiprocessing import Pool
 
+# Hyperbolic
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.init as init
+from torch.nn.modules.module import Module
+from geoopt.manifolds.stereographic import math as math1
+
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+
 model_names = sorted(name for name in models.__dict__
   if name.islower() and not name.startswith("__")
   and callable(models.__dict__[name]))
@@ -38,7 +50,7 @@ def str2bool(v):
 
 parser = argparse.ArgumentParser(description='Train Classifier with mixup', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 # Data
-parser.add_argument('--dataset', type=str, default='cifar10', choices=['cifar10', 'cifar100', 'tiny-imagenet-200'], help='Choose between Cifar10/100 and Tiny-ImageNet.')
+parser.add_argument('--dataset', type=str, default='cifar10', choices=['cifar10', 'cifar100', 'tiny-imagenet-200','stl10'], help='Choose between Cifar10/100 and Tiny-ImageNet, stl10.')
 parser.add_argument('--data_dir', type = str, default = 'cifar10', help='file where results are to be written')
 parser.add_argument('--root_dir', type = str, default = 'experiments', help='folder where results are to be stored')
 parser.add_argument('--labels_per_class', type=int, default=5000, metavar='NL', help='labels_per_class')
@@ -110,6 +122,47 @@ torch.cuda.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
 
 cudnn.benchmark = True
+
+class HypLinear(nn.Module):
+    """
+    Hyperbolic linear layer.
+    """
+
+    def __init__(self,in_features, out_features, c=1.0):
+        super(HypLinear, self).__init__()
+        #self.manifold = manifold
+        self.in_features = in_features
+        self.out_features = out_features
+        a = torch.tensor([1.0])
+        self.c = a.to(device="cuda")
+        #self.dropout = dropout
+        #self.use_bias = use_bias
+        #self.bias = nn.Parameter(torch.Tensor(out_features))
+        self.weight = torch.empty(out_features, in_features).fill_(1/in_features).to(device="cuda")
+        #print(self.weight)
+
+
+    def reset_parameters(self):
+        init.xavier_uniform_(self.weight, gain=math.sqrt(2))
+        init.constant_(self.bias, 0)
+
+    def forward(self, x):
+        #drop_weight = F.dropout(self.weight, self.dropout, training=self.training)
+        mv = math1.mobius_matvec(self.weight, x, k = self.c)
+        # res = math1.project(mv,k = self.c)
+        # if self.use_bias:
+        #     bias = math1.project(self.bias.view(1, -1), k = self.c)
+        #     hyp_bias = math1.expmap0(bias, k = self.c)
+        #     hyp_bias = math1.project(hyp_bias, k =self.c)
+        #     res = math1.mobius_add(res, hyp_bias, k=self.c)
+        #     res = math1.project(res,k = self.c)
+        res = math1.project(mv,k=self.c)
+        return res
+
+    def extra_repr(self):
+        return 'in_features={}, out_features={}, c={}'.format(
+            self.in_features, self.out_features, self.c
+        )
 
 
 def experiment_name_non_mnist(dataset=args.dataset,
@@ -239,7 +292,7 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
     model.train()
 
     end = time.time()
-    for i, (input, target) in enumerate(train_loader):
+    for i, (input, target) in tqdm(enumerate(train_loader)):
         data_time.update(time.time() - end)
         optimizer.zero_grad()
         
@@ -282,6 +335,8 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                     input_var = Variable(input, requires_grad=True)
                 target_var = Variable(target)
 
+                #print(input_var.shape)
+
                 # calculate saliency (unary)
                 if args.clean_lam == 0:
                     model.eval()
@@ -294,9 +349,46 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
 
                 loss_batch_mean = torch.mean(loss_batch, dim=0)
                 loss_batch_mean.backward(retain_graph=True)
+
+                ################## Hyperbolic #######################
+
+                sqr_grad = input_var.grad **2
+                sqr_grad = sqr_grad.cuda()
+
+                c = torch.tensor([1.0]).cuda()
+
+                sqr_grad_exp = math1.expmap0(sqr_grad,k=c)
+                sqr_grad_exp = torch.flatten(sqr_grad_exp,start_dim=2)
+
+                sqr_grad_exp = sqr_grad_exp.permute(0,2,1)
+                sqr_grad_exp = torch.flatten(sqr_grad_exp,start_dim=0,end_dim=1)
+
+                n_b = input_var.shape[0]
+                n_c = input_var.shape[1]
+                n_h = input_var.shape[2]
+                n_w = input_var.shape[3]
+                n_pixels = n_h*n_w
+     
+                hyp_mean=HypLinear(in_features=n_c,out_features=1)
+                hyp_mean.eval()
+                saliency =[]
+
+                data_loader = DataLoader(sqr_grad_exp,batch_size=(n_pixels*n_b),shuffle=False)
+                for i, batch in enumerate(data_loader):
+                  batch = batch.to(device='cuda')
+                  saliency.append(hyp_mean(batch))
+
                 
-                unary = torch.sqrt(torch.mean(input_var.grad **2, dim=1))
+                saliency = torch.cat(saliency) # 102400,1
+                saliency = saliency.T
+
+                saliency_unf = torch.nn.Unflatten(1,(n_b,n_h,n_w))(saliency)
+                saliency_unf = saliency_unf[0] # 100,32,32
+                ###################
                 
+                #unary = torch.sqrt(torch.mean(input_var.grad **2, dim=1))
+                unary = torch.sqrt(math1.logmap0(saliency_unf,k=c))
+
                 # calculate adversarial noise
                 if (adv_mask1 == 1 or adv_mask2 == 1):
                     noise += (args.adv_eps + 2) / 255. * input_var.grad.sign()
@@ -423,6 +515,11 @@ def main():
     # dataloader
     train_loader, valid_loader, _ , test_loader, num_classes = load_data_subset(args.batch_size, 2 ,args.dataset, args.data_dir, 
                 labels_per_class=args.labels_per_class, valid_labels_per_class=args.valid_labels_per_class, mixup_alpha=args.mixup_alpha)
+
+    print("Data loader lengths--Vishwa")
+    print(train_loader.__len__())
+    #print(valid_loader.__len__())
+    print(test_loader.__len__())
     
     if args.dataset == 'tiny-imagenet-200':
         stride = 2 
@@ -438,6 +535,11 @@ def main():
         stride = 1
         args.mean = torch.tensor([x / 255 for x in [129.3, 124.1, 112.4]], dtype=torch.float32).reshape(1,3,1,1).cuda()
         args.std = torch.tensor([x / 255 for x in [68.2, 65.4, 70.4]], dtype=torch.float32).reshape(1,3,1,1).cuda()
+        args.labels_per_class = 500
+    elif args.dataset == 'stl10':
+        stride = 2
+        args.mean = torch.tensor([0.44671097, 0.4398105, 0.4066468], dtype=torch.float32).reshape(1,3,1,1).cuda()
+        args.std = torch.tensor([0.2603405, 0.25657743, 0.27126738], dtype=torch.float32).reshape(1,3,1,1).cuda()
         args.labels_per_class = 500
     else:
         raise AssertionError('Given Dataset is not supported!')
